@@ -30,10 +30,10 @@
 
 #include <getopt.h>             /* getopt_long() */
 
-#include <fcntl.h>              /* low-level i/o */
+#include <fcntl.h>              /* low-level i/o */ // open system call
 #include <unistd.h>
 #include <errno.h>
-#include <sys/stat.h>
+#include <sys/stat.h>           // for stat struct
 #include <sys/types.h>
 #include <sys/time.h>
 #include <sys/mman.h>
@@ -80,25 +80,66 @@ static int              force_format=1;
 static int              frame_count = 30;
 
 /*************************************************************************
+ *                         Functions                                     *
+ *************************************************************************/
+
+/*************************************************************************
  *                       Error Handling Function                         *
  *************************************************************************/
 
 /**
+ * @name   errno_exit
  * @brief  Handles error, exits program
- * @param  none
+ * @param  const char *s - ptr to constant character string
  * 
- * @descr  Checks if file exists
- *         Checks if it's a device file
- *         Opens it
- *         Exits on failure
+ * @descr  Static: function scope limited to current file
+ *         Prints input str with error code and str describing error to std error output using fprintf
  *
  * @return none
  */
 
 static void errno_exit(const char *s)
 {
-        fprintf(stderr, "%s error %d, %s\n", s, errno, strerror(errno));
-        exit(EXIT_FAILURE);
+	    // printf outputs to standard output stream; fprintf goes to a file handle FILE*
+		// printf = fprintf(stout,)
+		// fprintf(FILE *stream, const char *format)
+        fprintf(stderr, "%s error %d, %s\n", s, errno, strerror(errno)); 
+		// stderr =  standard error output
+		// errno = error code of recent failure
+		// strerror(errno) = human-readable string describing the error taking input errno as error code
+        exit(EXIT_FAILURE); //EXIT_FAILURE from stdlib.h
+}
+
+/*************************************************************************
+ *                                IOCTL Function                         *
+ *************************************************************************/
+
+/**
+ * @name   xioctl
+ * @brief  Wrapper function for ioctl sys call, handles interruptions caused by signals
+ * @param  fh - fd on which ioctl op will be performed
+ *         request - request code indicating specific op to be performed
+ *         arg - ptr to arg/ds associated with ioctl function
+ * 
+ * @descr  Checks if file exists using stat
+ *         Checks if it's a device file by accessing st_mode and S_ISCHR
+ *         Open file with read and write permissions in non-blocking mode
+ *         Exit on failure of any mentioned above
+ *
+ * @return int r - return val of ioctl function
+ */
+ 
+static int xioctl(int fh, int request, void *arg)
+{
+        int r; // Stores ret val of ioctl sys call
+        // do wile to ensure ioctl is called at least once, runs until while condition false
+        do 
+        {
+            r = ioctl(fh, request, arg); // device-specific input/output operations
+
+        } while (r == -1 && errno == EINTR); // checks ioctl failure and if it was interrupted by signal EINTR
+
+        return r;
 }
 
 /*************************************************************************
@@ -106,76 +147,295 @@ static void errno_exit(const char *s)
  *************************************************************************/
 
 /**
+ * @name   open_device
  * @brief  Open camera device named dev_name
  * @param  none
  * 
- * @descr  Checks if file exists
- *         Checks if it's a device file
- *         Opens it
- *         Exits on failure
+ * @descr  Checks if file exists using stat
+ *         Checks if it's a device file by accessing st_mode and S_ISCHR
+ *         Open file with read and write permissions in non-blocking mode
+ *         Exit on failure of any mentioned above
  *
  * @return none
  */
  
 static void open_device()
 {
-        struct stat st; // To store file information
-
-        if (-1 == stat(dev_name, &st)) // device name and ptr to st passed to stat function
+        struct stat st; // To store file information; st variable of type struct stat
+				
+        // return val -1 on error
+        if (stat(dev_name, &st) == -1) //stat function retrieves info about file pointed to by dev_name and stores it in st structure
 		{
                 fprintf(stderr, "Cannot identify '%s': %d, %s\n", dev_name, errno, strerror(errno));
                 exit(EXIT_FAILURE);
         }
 
-        if (!S_ISCHR(st.st_mode)) //checks if a char special (device file)
+		// st_mode is member of struct stat which contains info about file type and permissions.
+        if (!S_ISCHR(st.st_mode)) //checks if mode is a char device; error if not char special file
 		{
                 fprintf(stderr, "%s is no device\n", dev_name);
                 exit(EXIT_FAILURE);
         }
 		
         // open system call to open device name with reading and writing in non-blocking mode
-        fd = open(dev_name, O_RDWR | O_NONBLOCK, 0);
+        fd = open(dev_name, O_RDWR | O_NONBLOCK, 0); //file name, flags, mode
+		// Access modes: O_NONBLOCK - file is opened in nonblocking mode (Doesn't wait for resource to be available)
+		// O_RDWR - file opened for both reading and writing
+		// mode = 0; no special permissions for file opened, use default, do not modify
 
-        if (-1 == fd) // exit on failure 
+        if (fd == -1) // exit on opening failure 
 		{
                 fprintf(stderr, "Cannot open '%s': %d, %s\n", dev_name, errno, strerror(errno));
                 exit(EXIT_FAILURE);
         }
 }
 
-
 /*************************************************************************
- *                                IOCTL Function                         *
+ *       Init MMAP Function called in init_device                        *
  *************************************************************************/
 
 /**
- * @brief  Open camera device named dev_name
+ * @name   init_mmap
+ * @brief  Initializes mem mapping for video capture buffers
  * @param  none
  * 
- * @descr  Checks if file exists
- *         Checks if it's a device file
- *         Opens it
- *         Exits on failure
+ * @descr  Requests buffers from the device driver and checks sufficiency
+ *         Queries buffer info
+ *         Allocates buffer structs
+ *         For each buffer, sets type, memory index and maps buffer memory into process's address space
+ *
+ * @return none
+ */
+
+static void init_mmap()
+{
+        struct v4l2_requestbuffers req; //struct to request memory buffers from device driver
+
+        CLEAR(req); //clears memory associated with req struct
+
+        req.count = 6; // buffers requested from device
+        req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE; // type requested video capture buffers
+        req.memory = V4L2_MEMORY_MMAP; // memory mapping used for buffers
+
+        if (xioctl(fd, VIDIOC_REQBUFS, &req) == -1) //request memory buffers from the device drive check
+        {
+                if (EINVAL == errno) 
+                {
+                        fprintf(stderr, "%s does not support memory mapping\n", dev_name);
+                        exit(EXIT_FAILURE);
+                } else 
+                {
+                        errno_exit("VIDIOC_REQBUFS");
+                }
+        }
+
+        if (req.count < 2) //checks if requested number of buffers is sufficient
+        {
+                fprintf(stderr, "Insufficient buffer memory on %s\n", dev_name);
+                exit(EXIT_FAILURE);
+        }
+
+        buffers = calloc(req.count, sizeof(*buffers)); //dynamically allocates memory for arr of buffer structs (each memory-mapped buffer)
+
+        if (!buffers) 
+        {
+                fprintf(stderr, "Out of memory\n");
+                exit(EXIT_FAILURE);
+        }
+
+        for (n_buffers = 0; n_buffers < req.count; ++n_buffers) //iterates over each buffer requested and obtained from device driver
+		{ // for each buffer
+                struct v4l2_buffer buf; //initializes a v4l2_buffer structure buf 
+
+                CLEAR(buf); //clears its memory
+				
+				// set buffer type, memory and index
+                buf.type        = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+                buf.memory      = V4L2_MEMORY_MMAP;
+                buf.index       = n_buffers;
+
+                if (xioctl(fd, VIDIOC_QUERYBUF, &buf) == -1) //request to query buffer info from device driver
+                        errno_exit("VIDIOC_QUERYBUF");
+
+                buffers[n_buffers].length = buf.length; //Stores buffer length obtained from driver in corresponding buffer struct in buffers arr
+				//Uses mmap to map the buffer's memory into process's address space; mapped memory stored in start member of corresponding buffer struct
+                buffers[n_buffers].start =
+                        mmap(NULL /* start anywhere */,
+                              buf.length,
+                              PROT_READ | PROT_WRITE /* required */,
+                              MAP_SHARED /* recommended */,
+                              fd, buf.m.offset);
+
+                if (MAP_FAILED == buffers[n_buffers].start) // checks mmap failure
+                        errno_exit("mmap");
+        }
+}
+
+/*************************************************************************
+ *                          Init Device Function                         *
+ *************************************************************************/
+
+/**
+ * @name   init_device
+ * @brief  Initializes video capture device
+ * @param  none
+ * 
+ * @descr  Queries device's capabilties
+ *         Checks if device supports video capture and streaming I/O
+ *         Queries and sets cropping parameters
+ *         Configures video format
+ *         Ensures proper buffer size
+ *         Initializes memory mapping
+ *
+ * @return none
+ */
+
+static void init_device()
+{
+    struct v4l2_capability cap; // struct holds device capabilities
+    struct v4l2_cropcap cropcap; // struct holds cropping capabilities
+    struct v4l2_crop crop; // struct holds cropping settings
+    unsigned int min; // min buffer size
+
+    if (xioctl(fd, VIDIOC_QUERYCAP, &cap) == -1) // queries the device's capabilities 
+    {
+        if (errno == EINVAL) 
+		{
+            fprintf(stderr, "%s is no V4L2 device\n", dev_name);
+            exit(EXIT_FAILURE);
+        }
+        else
+        {
+            errno_exit("VIDIOC_QUERYCAP");
+        }
+    }
+	
+	// checks if device supports video capture and streaming I/O by examining capabilities returned by query
+    if (!(cap.capabilities & V4L2_CAP_VIDEO_CAPTURE))
+    {
+        fprintf(stderr, "%s is no video capture device\n", dev_name);
+        exit(EXIT_FAILURE);
+    }
+    if (!(cap.capabilities & V4L2_CAP_STREAMING))
+    {
+        fprintf(stderr, "%s does not support streaming i/o\n", dev_name);
+        exit(EXIT_FAILURE);
+    }
+  
+
+    // Select video input, video standard and tune here.
+
+    CLEAR(cropcap); // clears memory associated with cropcap struct
+
+    cropcap.type = V4L2_BUF_TYPE_VIDEO_CAPTURE; //set type of cropping operation for video capture
+
+    if (xioctl(fd, VIDIOC_CROPCAP, &cropcap) == 0) //Queries cropping capabilities of device and stores them in cropcap
+    {   // on success enters
+        crop.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        crop.c = cropcap.defrect; /* reset to default */
+
+        if (xioctl(fd, VIDIOC_S_CROP, &crop) == -1)
+        {
+			if(errno == EINVAL)
+				fprintf(stderr, "Cropping not supported\n");
+        }
+    }
+
+    CLEAR(fmt); //clears v4l2 format struct var
+
+    fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE; //set type of video capture
+
+    if (force_format)
+    {
+        fmt.fmt.pix.width       = HRES;
+        fmt.fmt.pix.height      = VRES;
+        fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_YUYV; // This one work for Logitech C200
+        fmt.fmt.pix.field       = V4L2_FIELD_NONE;
+
+        if (xioctl(fd, VIDIOC_S_FMT, &fmt) == -1)
+            errno_exit("VIDIOC_S_FMT");
+
+        /* Note VIDIOC_S_FMT may change width and height. */
+    }
+    else
+    {
+        printf("ASSUMING FORMAT\n");
+        /* Preserve original settings as set by v4l2-ctl for example */
+        if (xioctl(fd, VIDIOC_G_FMT, &fmt) == -1)
+            errno_exit("VIDIOC_G_FMT");
+    }
+
+    // Buggy driver paranoia.
+	//precautionary measure for buggy drivers
+	//ensures buffer size (sizeimage) is large enough to hold the captured image data
+	// calculates min req buffer size based on the width, height, and bytes per line, and adjusts bytesperline and sizeimage if necessary.
+    min = fmt.fmt.pix.width * 2;
+    if (fmt.fmt.pix.bytesperline < min)
+            fmt.fmt.pix.bytesperline = min;
+		
+    min = fmt.fmt.pix.bytesperline * fmt.fmt.pix.height;
+    if (fmt.fmt.pix.sizeimage < min)
+            fmt.fmt.pix.sizeimage = min;
+
+    init_mmap(); //initialize memory mapping for video capture (efficient data transfer between user space and device)
+}
+
+/*************************************************************************
+ *                      Start capturing Function                         *
+ *************************************************************************/
+
+/**
+ * @name   start_capturing
+ * @brief  Prepares device for video capture bu queueing buffers for capturing and starting video stream
+ * @param  none
+ * 
+ * @descr  Queues buffers
+ *         Starts video stream
+ *
+ * @return none
+ */
+
+static void start_capturing()
+{
+        unsigned int i;
+        enum v4l2_buf_type type; // buffer type for streaming
+
+        for (i = 0; i < n_buffers; ++i) //iterates over each buffer allocated during initialization
+        {
+            //printf("allocated buffer %d\n", i);
+            struct v4l2_buffer buf; //init struct
+
+            CLEAR(buf); //clear it
+			//sets buffer type, memory type, and buffer index
+            buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+            buf.memory = V4L2_MEMORY_MMAP;
+            buf.index = i;
+
+            if (xioctl(fd, VIDIOC_QBUF, &buf) == -1) //request to enqueue the buffer for video capture
+                errno_exit("VIDIOC_QBUF");
+        }
+		
+		//After queuing all buffers, sets the type variable to V4L2_BUF_TYPE_VIDEO_CAPTURE to specify the buffer type for streaming
+        type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        if (xioctl(fd, VIDIOC_STREAMON, &type) == -1) //request to start streaming video
+            errno_exit("VIDIOC_STREAMON");
+}
+
+/*************************************************************************
+ *         Dump PPM Function called in Image Processing Function         *
+ *************************************************************************/
+ 
+ /**
+ * @name   start_capturing
+ * @brief  Prepares device for video capture bu queueing buffers for capturing and starting video stream
+ * @param  none
+ * 
+ * @descr  Queues buffers
+ *         Starts video stream
  *
  * @return none
  */
  
-static int xioctl(int fh, int request, void *arg)
-{
-        int r;
-
-        do 
-        {
-            r = ioctl(fh, request, arg);
-
-        } while (-1 == r && EINTR == errno);
-
-        return r;
-}
-
-/*************************************************************************
- *                             Dump PPM Function                         *
- *************************************************************************/
 char ppm_header[]="P6\n#9999999999 sec 9999999999 msec \n"HRES_STR" "VRES_STR"\n255\n";
 char ppm_dumpname[]="frames/test00000000.ppm";
 
@@ -205,8 +465,19 @@ static void dump_ppm(const void *p, int size, unsigned int tag, struct timespec 
 }
 
 /*************************************************************************
- *                YUV to RGB Conversion Function                         *
+ * YUV to RGB Conversion Function called in Image Processing Function    *
  *************************************************************************/
+ 
+ /**
+ * @name   start_capturing
+ * @brief  Prepares device for video capture bu queueing buffers for capturing and starting video stream
+ * @param  none
+ * 
+ * @descr  Queues buffers
+ *         Starts video stream
+ *
+ * @return none
+ */
 
 // This is probably the most acceptable conversion from camera YUYV to RGB
 //
@@ -250,8 +521,19 @@ void yuv2rgb(int y, int u, int v, unsigned char *r, unsigned char *g, unsigned c
 }
 
 /*************************************************************************
- *                     Image Processing Function                         *
+ *          Image Processing Function called in Read_frame               *
  *************************************************************************/
+ 
+ /**
+ * @name   start_capturing
+ * @brief  Prepares device for video capture bu queueing buffers for capturing and starting video stream
+ * @param  none
+ * 
+ * @descr  Queues buffers
+ *         Starts video stream
+ *
+ * @return none
+ */
 
 unsigned int framecnt=0;
 unsigned char bigbuffer[(1280*960)];
@@ -305,7 +587,21 @@ static void process_image(const void *p, int size)
     fflush(stdout);
 }
 
-
+/*************************************************************************
+ *                 Read frame Function called in Main loop               *
+ *************************************************************************/
+ 
+ /**
+ * @name   start_capturing
+ * @brief  Prepares device for video capture bu queueing buffers for capturing and starting video stream
+ * @param  none
+ * 
+ * @descr  Queues buffers
+ *         Starts video stream
+ *
+ * @return none
+ */
+ 
 static int read_frame()
 {
     struct v4l2_buffer buf;
@@ -343,6 +639,20 @@ static int read_frame()
     return 1;
 }
 
+/*************************************************************************
+ *                           Main loop function                          *
+ *************************************************************************/
+ 
+ /**
+ * @name   mainloop
+ * @brief  Prepares device for video capture bu queueing buffers for capturing and starting video stream
+ * @param  none
+ * 
+ * @descr  Queues buffers
+ *         Starts video stream
+ *
+ * @return none
+ */
 
 static void mainloop()
 {
@@ -401,261 +711,108 @@ static void mainloop()
     }
 }
 
+
+/*************************************************************************
+ *                       Stop capturing Function                         *
+ *************************************************************************/
+
+/**
+ * @name   stop_capturing
+ * @brief  Initializes video capture device
+ * @param  none
+ * 
+ * @descr  Stops video stream
+ *
+ * @return none
+ */
+ 
 static void stop_capturing()
 {
-        enum v4l2_buf_type type;
+        enum v4l2_buf_type type; // buffer type for streaming
 
-        type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-        if (-1 == xioctl(fd, VIDIOC_STREAMOFF, &type))
+        type = V4L2_BUF_TYPE_VIDEO_CAPTURE; // sets type as video capture
+        if (xioctl(fd, VIDIOC_STREAMOFF, &type) == -1) // request to stop video stream
             errno_exit("VIDIOC_STREAMOFF");
 }
 
-static void start_capturing()
-{
-        unsigned int i;
-        enum v4l2_buf_type type;
+/*************************************************************************
+ *                        UnInit Device Function                         *
+ *************************************************************************/
 
-        for (i = 0; i < n_buffers; ++i) 
-        {
-            //printf("allocated buffer %d\n", i);
-            struct v4l2_buffer buf;
-
-            CLEAR(buf);
-            buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-            buf.memory = V4L2_MEMORY_MMAP;
-            buf.index = i;
-
-            if (-1 == xioctl(fd, VIDIOC_QBUF, &buf))
-                errno_exit("VIDIOC_QBUF");
-        }
-        type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-        if (-1 == xioctl(fd, VIDIOC_STREAMON, &type))
-            errno_exit("VIDIOC_STREAMON");
-}
-
+/**
+ * @name   uninit_device
+ * @brief  Uninitializes video capture device
+ * @param  none
+ * 
+ * @descr  Avoids mem leak by releasing allocated memory
+ *
+ * @return none
+ */
+ 
 static void uninit_device()
 {
         unsigned int i;
+		//munmap function deallocates memory region mapped by mmap, which was used for memory mapping the device buffers
 
-        for (i = 0; i < n_buffers; ++i)
-            if (-1 == munmap(buffers[i].start, buffers[i].length))
+        for (i = 0; i < n_buffers; ++i) // iterates over each buffer allocated during init phase
+            if (munmap(buffers[i].start, buffers[i].length) == -1) // munmap function to unmap the memory associated with each buffer
                 errno_exit("munmap");
 			
-        free(buffers);
+        free(buffers); //After unmapping all buffers, frees memory allocated for array of buffer structs
 }
 
-static void init_read(unsigned int buffer_size)
-{
-        buffers = calloc(1, sizeof(*buffers));
+/*************************************************************************
+ *                          Close Device Function                         *
+ *************************************************************************/
 
-        if (!buffers) 
-        {
-                fprintf(stderr, "Out of memory\n");
-                exit(EXIT_FAILURE);
-        }
-
-        buffers[0].length = buffer_size;
-        buffers[0].start = malloc(buffer_size);
-
-        if (!buffers[0].start) 
-        {
-                fprintf(stderr, "Out of memory\n");
-                exit(EXIT_FAILURE);
-        }
-}
-
-static void init_mmap(void)
-{
-        struct v4l2_requestbuffers req;
-
-        CLEAR(req);
-
-        req.count = 6;
-        req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-        req.memory = V4L2_MEMORY_MMAP;
-
-        if (-1 == xioctl(fd, VIDIOC_REQBUFS, &req)) 
-        {
-                if (EINVAL == errno) 
-                {
-                        fprintf(stderr, "%s does not support "
-                                 "memory mapping\n", dev_name);
-                        exit(EXIT_FAILURE);
-                } else 
-                {
-                        errno_exit("VIDIOC_REQBUFS");
-                }
-        }
-
-        if (req.count < 2) 
-        {
-                fprintf(stderr, "Insufficient buffer memory on %s\n", dev_name);
-                exit(EXIT_FAILURE);
-        }
-
-        buffers = calloc(req.count, sizeof(*buffers));
-
-        if (!buffers) 
-        {
-                fprintf(stderr, "Out of memory\n");
-                exit(EXIT_FAILURE);
-        }
-
-        for (n_buffers = 0; n_buffers < req.count; ++n_buffers) {
-                struct v4l2_buffer buf;
-
-                CLEAR(buf);
-
-                buf.type        = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-                buf.memory      = V4L2_MEMORY_MMAP;
-                buf.index       = n_buffers;
-
-                if (-1 == xioctl(fd, VIDIOC_QUERYBUF, &buf))
-                        errno_exit("VIDIOC_QUERYBUF");
-
-                buffers[n_buffers].length = buf.length;
-                buffers[n_buffers].start =
-                        mmap(NULL /* start anywhere */,
-                              buf.length,
-                              PROT_READ | PROT_WRITE /* required */,
-                              MAP_SHARED /* recommended */,
-                              fd, buf.m.offset);
-
-                if (MAP_FAILED == buffers[n_buffers].start)
-                        errno_exit("mmap");
-        }
-}
-
-static void init_device()
-{
-    struct v4l2_capability cap;
-    struct v4l2_cropcap cropcap;
-    struct v4l2_crop crop;
-    unsigned int min;
-
-    if (-1 == xioctl(fd, VIDIOC_QUERYCAP, &cap))
-    {
-        if (EINVAL == errno) {
-            fprintf(stderr, "%s is no V4L2 device\n",
-                     dev_name);
-            exit(EXIT_FAILURE);
-        }
-        else
-        {
-                errno_exit("VIDIOC_QUERYCAP");
-        }
-    }
-
-    if (!(cap.capabilities & V4L2_CAP_VIDEO_CAPTURE))
-    {
-        fprintf(stderr, "%s is no video capture device\n",
-                 dev_name);
-        exit(EXIT_FAILURE);
-    }
-
-
-    if (!(cap.capabilities & V4L2_CAP_STREAMING))
-    {
-        fprintf(stderr, "%s does not support streaming i/o\n", dev_name);
-        exit(EXIT_FAILURE);
-    }
-  
-
-    /* Select video input, video standard and tune here. */
-
-
-    CLEAR(cropcap);
-
-    cropcap.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-
-    if (0 == xioctl(fd, VIDIOC_CROPCAP, &cropcap))
-    {
-        crop.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-        crop.c = cropcap.defrect; /* reset to default */
-
-        if (-1 == xioctl(fd, VIDIOC_S_CROP, &crop))
-        {
-            switch (errno)
-            {
-                case EINVAL:
-                    /* Cropping not supported. */
-                    break;
-                default:
-                    /* Errors ignored. */
-                        break;
-            }
-        }
-
-    }
-    else
-    {
-        /* Errors ignored. */
-    }
-
-
-    CLEAR(fmt);
-
-    fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-
-    if (force_format)
-    {
-        //printf("FORCING FORMAT\n");
-        fmt.fmt.pix.width       = HRES;
-        fmt.fmt.pix.height      = VRES;
-
-        // Specify the Pixel Coding Formate here
-
-        // This one work for Logitech C200
-        fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_YUYV;
-        fmt.fmt.pix.field       = V4L2_FIELD_NONE;
-
-        if (-1 == xioctl(fd, VIDIOC_S_FMT, &fmt))
-                errno_exit("VIDIOC_S_FMT");
-
-        /* Note VIDIOC_S_FMT may change width and height. */
-    }
-    else
-    {
-        printf("ASSUMING FORMAT\n");
-        /* Preserve original settings as set by v4l2-ctl for example */
-        if (-1 == xioctl(fd, VIDIOC_G_FMT, &fmt))
-                    errno_exit("VIDIOC_G_FMT");
-    }
-
-    /* Buggy driver paranoia. */
-    min = fmt.fmt.pix.width * 2;
-    if (fmt.fmt.pix.bytesperline < min)
-            fmt.fmt.pix.bytesperline = min;
-    min = fmt.fmt.pix.bytesperline * fmt.fmt.pix.height;
-    if (fmt.fmt.pix.sizeimage < min)
-            fmt.fmt.pix.sizeimage = min;
-
-    init_mmap();
-}
-
-
+/**
+ * @name   close_device
+ * @brief  Closes camera device named dev_name
+ * @param  none
+ * 
+ * @descr  Close camera device pointed to by fd
+ *         Set fd as -1 to not accidentally use file after closure
+ *
+ * @return none
+ */
+ 
 static void close_device()
 {
-        if (-1 == close(fd))
-                errno_exit("close");
-
-        fd = -1;
+        if (close(fd) == -1) // check status of closing fd = camera device
+		{
+            errno_exit("close");
+		}
+        fd = -1; //set fd to -1, so fd is not accidentally used after closure
 }
 
+
+/*************************************************************************
+ *                                 Main Function                         *
+ *************************************************************************/
+ 
 int main(int argc, char **argv)
 {
+	//argv[0] = name of program itself
     if(argc > 1)
-        dev_name = argv[1];
+        dev_name = argv[1]; // video device name provided in CLI
     else
         dev_name = "/dev/video0";
-
+	
+	printf("Starting camera driver...\n");
     open_device();
+	printf("Camera device opened...\n");
     init_device();
+	printf("Initialized device...\n");
+	
     start_capturing();
     mainloop();
     stop_capturing();
+	
     uninit_device();
+	printf("Uninitialized device...\n");
     close_device();
+	printf("Closed device...\n");
     fprintf(stderr, "\n");
+	printf("Exiting program!\n");
     return 0;
 }
